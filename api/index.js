@@ -4,14 +4,12 @@ const ytdl = require("@distube/ytdl-core");
 module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   
-  // URL থেকে চেক করা হচ্ছে সে সার্চ চাইছে নাকি ডাউনলোড লিংক চাইছে
-  const action = req.query.action; 
+  const { url, type = "audio", q } = req.query;
+  const path = req.url; // চেক করবে ইউজার সার্চ চাইছে নাকি ডাউনলোড
 
-  // ১. সার্চ রিকোয়েস্ট হলে
-  if (action === "search") {
-    const q = req.query.q;
+  // ১. সার্চ রিকোয়েস্ট
+  if (path.includes("search")) {
     if (!q) return res.status(400).json({ success: false, error: "Query required" });
-    
     try {
       const search = await yts(String(q));
       const results = search.videos.slice(0, 5).map(v => ({
@@ -23,11 +21,9 @@ module.exports = async (req, res) => {
     }
   }
 
-  // ২. ডাউনলোড লিংক রিকোয়েস্ট হলে
-  if (action === "info") {
-    const { url, type } = req.query;
+  // ২. ডাউনলোড লিংক রিকোয়েস্ট
+  if (path.includes("info")) {
     if (!url) return res.status(400).json({ success: false, error: "URL required" });
-
     try {
       let agent = null;
       if (process.env.YT_COOKIE) {
@@ -48,6 +44,6 @@ module.exports = async (req, res) => {
     }
   }
 
-  // যদি ভুল লিংকে হিট করে
-  return res.status(404).json({ success: false, error: "Invalid Route" });
+  // ৩. মেইন পেজ (যদি কেউ শুধু লিংকে হিট করে)
+  return res.json({ success: true, message: "API is working perfectly!" });
 };
