@@ -2,7 +2,7 @@
   "name": "yt-api",
   "version": "1.0.0",
   "private": true,
-  "engines": { "node": "20.x" },
+  "engines": { "node": "26.x" },
   "dependencies": {
     "@distube/ytdl-core": "^4.16.0",
     "yt-search": "^2.13.1"
