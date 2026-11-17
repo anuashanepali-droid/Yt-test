@@ -6,6 +6,7 @@
  *   /api/ytest?key=KEY&cookies=1        PO Token সহ, কুকিজ সহ (YT_COOKIES থেকে, না থাকলে cookies.txt)
  *   /api/ytest?key=KEY&pot=0            PO Token ছাড়া (তুলনার জন্য)
  *   /api/ytest?key=KEY&client=web       YouTube এর "web" ক্লায়েন্ট জোর করে (PO Token চাইবে)
+ *   /api/ytest?key=KEY&probe=1&cookies=1&src=file   সব ক্লায়েন্ট পরীক্ষা করে কার্যকরটা দিয়ে ডাউনলোড
  *   /api/ytest?key=KEY&v=ভিডিও_আইডি     অন্য ভিডিও
  */
 const fs = require("fs");
@@ -153,6 +154,43 @@ function run(args, timeout) {
 	});
 }
 
+
+// কুকিজ সাপোর্ট করে না এমন ক্লায়েন্ট (এগুলো কুকিজ ছাড়া চালাতে হয়)
+const NO_COOKIE_CLIENTS = new Set(["ios", "android", "android_vr", "tv_simply"]);
+const PROBE_CLIENTS = ["mweb", "web_safari", "tv", "web_embedded", "ios", "android_vr"];
+
+async function probeClient(client, baseArgs, cookieArgs, v) {
+	const useCk = !NO_COOKIE_CLIENTS.has(client);
+	const args = [
+		...baseArgs,
+		...(useCk ? cookieArgs : []),
+		"--extractor-args", `youtube:player_client=${client}`,
+		"-F", "--skip-download", "--no-playlist",
+		"--socket-timeout", "6", "--retries", "1",
+		"--cache-dir", "/tmp/ytc",
+		`https://www.youtube.com/watch?v=${v}`
+	];
+	const r = await run(args, 12000);
+	const text = r.stderr + "\n" + r.stdout;
+	const audio = (r.stdout.match(/audio only/gi) || []).length;
+	const note = (text.split("\n").find(l => /SABR|ERROR|Sign in|Only images|skipp/i.test(l)) || "").trim().slice(0, 150);
+	return { client, audio, sabr: /SABR/i.test(text), cookies: useCk, note };
+}
+
+async function probeAll(baseArgs, cookieArgs, v) {
+	const results = new Array(PROBE_CLIENTS.length);
+	let next = 0;
+	const worker = async () => {
+		while (next < PROBE_CLIENTS.length) {
+			const i = next++;
+			try { results[i] = await probeClient(PROBE_CLIENTS[i], baseArgs, cookieArgs, v); }
+			catch (e) { results[i] = { client: PROBE_CLIENTS[i], audio: 0, note: String(e.message || e).slice(0, 120) }; }
+		}
+	};
+	await Promise.all([worker(), worker(), worker()]);
+	return results;
+}
+
 module.exports = async (req, res) => {
 	const t0 = Date.now();
 	const q = req.query || {};
@@ -193,19 +231,39 @@ module.exports = async (req, res) => {
 			if (ck) { out.cookieInfo = ck; cookieArgs.push("--cookies", COOKIE_FILE); }
 		}
 
-		// ?client=web বা ?client=web,mweb দিলে ওই YouTube ক্লায়েন্ট জোর করে ব্যবহার হবে
-		const clientArgs = /^[a-z_,]+$/.test(q.client || "")
-			? ["--extractor-args", `youtube:player_client=${q.client}`]
+		const baseArgs = [
+			"--js-runtimes", `node:${process.execPath}`,
+			"--remote-components", "ejs:github",
+			"--extractor-args", `youtubepot-bgutilhttp:base_url=http://127.0.0.1:${POT_PORT}`
+		];
+
+		// ?probe=1 দিলে সব ক্লায়েন্ট পরীক্ষা করে প্রথম কার্যকরটা দিয়ে ডাউনলোড করে
+		let chosenClient = /^[a-z_,]+$/.test(q.client || "") ? q.client : null;
+		if (q.probe === "1") {
+			out.probe = await probeAll(baseArgs, cookieArgs, v);
+			const best = out.probe.find(x => x && x.audio > 0);
+			chosenClient = best ? best.client : null;
+			out.probeBest = chosenClient;
+		}
+		const skipCookies = chosenClient && NO_COOKIE_CLIENTS.has(chosenClient);
+		const clientArgs = chosenClient
+			? ["--extractor-args", `youtube:player_client=${chosenClient}`]
 			: [];
-		out.client = q.client || "default";
+		out.client = chosenClient || "default";
+
+		if (q.probe === "1" && !chosenClient) {
+			out.ok = false;
+			out.verdict = "❌ কোনো ক্লায়েন্টেই অডিও ফরম্যাট পাওয়া যায়নি (probe দেখো)";
+			out.totalMs = Date.now() - t0;
+			res.status(200).json(out);
+			return;
+		}
 
 		const base = `/tmp/t_${Date.now()}`;
 		const args = [
-			"--js-runtimes", `node:${process.execPath}`,
-			"--remote-components", "ejs:github",
-			"--extractor-args", `youtubepot-bgutilhttp:base_url=http://127.0.0.1:${POT_PORT}`,
+			...baseArgs,
 			...clientArgs,
-			...cookieArgs,
+			...(skipCookies ? [] : cookieArgs),
 			"-v",
 			"--no-playlist",
 			"--max-filesize", "30M",
@@ -224,7 +282,7 @@ module.exports = async (req, res) => {
 		out.log = text
 			.split("\n")
 			.map(l => l.replace(/^\[debug\]\s*/i, "").trim())
-			.filter(l => /WARNING|ERROR|JS runtimes|PO Token|pot:|bgutil|403|Sign in|bot|Destination|images/i.test(l))
+			.filter(l => /WARNING|ERROR|JS runtimes|PO Token|pot:|bgutil|403|Sign in|bot|Destination|images|SABR/i.test(l))
 			.slice(0, 16)
 			.map(l => l.slice(0, 180));
 
@@ -247,4 +305,4 @@ module.exports = async (req, res) => {
 	out.totalMs = Date.now() - t0;
 	res.status(200).json(out);
 };
-		
+							  
