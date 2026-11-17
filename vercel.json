@@ -1,7 +1,8 @@
 {
   "functions": {
     "api/ytest.js": {
-      "maxDuration": 60
+      "maxDuration": 60,
+      "includeFiles": "cookies.txt"
     }
   }
 }
