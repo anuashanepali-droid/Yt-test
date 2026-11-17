@@ -6,6 +6,7 @@
  *   /api/ytest?key=KEY&cookies=1        PO Token সহ, কুকিজ সহ (YT_COOKIES থেকে, না থাকলে cookies.txt)
  *   /api/ytest?key=KEY&pot=0            PO Token ছাড়া (তুলনার জন্য)
  *   /api/ytest?key=KEY&client=web       YouTube এর "web" ক্লায়েন্ট জোর করে (PO Token চাইবে)
+ *   ...&fetchpot=always                 সব ক্লায়েন্টে PO Token আনতে বাধ্য করে
  *   /api/ytest?key=KEY&probe=1&cookies=1&src=file   সব ক্লায়েন্ট পরীক্ষা করে কার্যকরটা দিয়ে ডাউনলোড
  *   /api/ytest?key=KEY&v=ভিডিও_আইডি     অন্য ভিডিও
  */
@@ -159,12 +160,12 @@ function run(args, timeout) {
 const NO_COOKIE_CLIENTS = new Set(["ios", "android", "android_vr", "tv_simply"]);
 const PROBE_CLIENTS = ["mweb", "web_safari", "tv", "web_embedded", "ios", "android_vr"];
 
-async function probeClient(client, baseArgs, cookieArgs, v) {
+async function probeClient(client, baseArgs, cookieArgs, v, fetchAlways) {
 	const useCk = !NO_COOKIE_CLIENTS.has(client);
 	const args = [
 		...baseArgs,
 		...(useCk ? cookieArgs : []),
-		"--extractor-args", `youtube:player_client=${client}`,
+		"--extractor-args", `youtube:player_client=${client}${fetchAlways ? ";fetch_pot=always" : ""}`,
 		"-F", "--skip-download", "--no-playlist",
 		"--socket-timeout", "6", "--retries", "1",
 		"--cache-dir", "/tmp/ytc",
@@ -177,13 +178,13 @@ async function probeClient(client, baseArgs, cookieArgs, v) {
 	return { client, audio, sabr: /SABR/i.test(text), cookies: useCk, note };
 }
 
-async function probeAll(baseArgs, cookieArgs, v) {
+async function probeAll(baseArgs, cookieArgs, v, fetchAlways) {
 	const results = new Array(PROBE_CLIENTS.length);
 	let next = 0;
 	const worker = async () => {
 		while (next < PROBE_CLIENTS.length) {
 			const i = next++;
-			try { results[i] = await probeClient(PROBE_CLIENTS[i], baseArgs, cookieArgs, v); }
+			try { results[i] = await probeClient(PROBE_CLIENTS[i], baseArgs, cookieArgs, v, fetchAlways); }
 			catch (e) { results[i] = { client: PROBE_CLIENTS[i], audio: 0, note: String(e.message || e).slice(0, 120) }; }
 		}
 	};
@@ -204,7 +205,8 @@ module.exports = async (req, res) => {
 	const v = /^[\w-]{11}$/.test(q.v || "") ? q.v : "e2mUj9rGSmQ";
 	const usePot = q.pot !== "0";
 	const useCookies = q.cookies === "1";
-	const out = { video: v, node: process.version, usePot, useCookies };
+	const fetchAlways = q.fetchpot === "always";
+	const out = { video: v, node: process.version, usePot, useCookies, fetchAlways };
 	let pot = null;
 
 	try {
@@ -240,15 +242,16 @@ module.exports = async (req, res) => {
 		// ?probe=1 দিলে সব ক্লায়েন্ট পরীক্ষা করে প্রথম কার্যকরটা দিয়ে ডাউনলোড করে
 		let chosenClient = /^[a-z_,]+$/.test(q.client || "") ? q.client : null;
 		if (q.probe === "1") {
-			out.probe = await probeAll(baseArgs, cookieArgs, v);
+			out.probe = await probeAll(baseArgs, cookieArgs, v, fetchAlways);
 			const best = out.probe.find(x => x && x.audio > 0);
 			chosenClient = best ? best.client : null;
 			out.probeBest = chosenClient;
 		}
 		const skipCookies = chosenClient && NO_COOKIE_CLIENTS.has(chosenClient);
-		const clientArgs = chosenClient
-			? ["--extractor-args", `youtube:player_client=${chosenClient}`]
-			: [];
+		const ytParts = [];
+		if (chosenClient) ytParts.push(`player_client=${chosenClient}`);
+		if (fetchAlways) ytParts.push("fetch_pot=always");
+		const clientArgs = ytParts.length ? ["--extractor-args", `youtube:${ytParts.join(";")}`] : [];
 		out.client = chosenClient || "default";
 
 		if (q.probe === "1" && !chosenClient) {
@@ -305,4 +308,4 @@ module.exports = async (req, res) => {
 	out.totalMs = Date.now() - t0;
 	res.status(200).json(out);
 };
-							  
+			 
