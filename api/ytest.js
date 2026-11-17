@@ -5,6 +5,7 @@
  *   /api/ytest?key=KEY&cookies=1&src=file  PO Token সহ, কুকিজ সহ (গিটহাবের cookies.txt থেকে)
  *   /api/ytest?key=KEY&cookies=1        PO Token সহ, কুকিজ সহ (YT_COOKIES থেকে, না থাকলে cookies.txt)
  *   /api/ytest?key=KEY&pot=0            PO Token ছাড়া (তুলনার জন্য)
+ *   /api/ytest?key=KEY&client=web       YouTube এর "web" ক্লায়েন্ট জোর করে (PO Token চাইবে)
  *   /api/ytest?key=KEY&v=ভিডিও_আইডি     অন্য ভিডিও
  */
 const fs = require("fs");
@@ -192,11 +193,18 @@ module.exports = async (req, res) => {
 			if (ck) { out.cookieInfo = ck; cookieArgs.push("--cookies", COOKIE_FILE); }
 		}
 
+		// ?client=web বা ?client=web,mweb দিলে ওই YouTube ক্লায়েন্ট জোর করে ব্যবহার হবে
+		const clientArgs = /^[a-z_,]+$/.test(q.client || "")
+			? ["--extractor-args", `youtube:player_client=${q.client}`]
+			: [];
+		out.client = q.client || "default";
+
 		const base = `/tmp/t_${Date.now()}`;
 		const args = [
 			"--js-runtimes", `node:${process.execPath}`,
 			"--remote-components", "ejs:github",
 			"--extractor-args", `youtubepot-bgutilhttp:base_url=http://127.0.0.1:${POT_PORT}`,
+			...clientArgs,
 			...cookieArgs,
 			"-v",
 			"--no-playlist",
