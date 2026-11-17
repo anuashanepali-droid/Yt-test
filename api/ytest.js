@@ -1,17 +1,40 @@
 /*
- * ছোট পরীক্ষা: ভার্সেলের সার্ভার থেকে YouTube অডিও নামানো যায় কিনা
- * ব্যবহার: /api/ytest?key=তোমার_TEST_KEY            (ডাউনলোড পরীক্ষা)
- *          /api/ytest?key=...&mode=list             (শুধু ফরম্যাট তালিকা)
- *          /api/ytest?key=...&v=ভিডিও_আইডি          (অন্য ভিডিও)
- *          /api/ytest?key=...&src=file              (কুকিজ রিপোর cookies.txt থেকে)
+ * পরীক্ষা: ভার্সেল থেকে PO Token সহ YouTube অডিও নামানো যায় কিনা
+ * ব্যবহার:
+ *   /api/ytest?key=KEY                  PO Token সহ, কুকিজ ছাড়া (প্রথমে এটা চালাও)
+ *   /api/ytest?key=KEY&cookies=1&src=file  PO Token সহ, কুকিজ সহ (গিটহাবের cookies.txt থেকে)
+ *   /api/ytest?key=KEY&cookies=1        PO Token সহ, কুকিজ সহ (YT_COOKIES থেকে, না থাকলে cookies.txt)
+ *   /api/ytest?key=KEY&pot=0            PO Token ছাড়া (তুলনার জন্য)
+ *   /api/ytest?key=KEY&v=ভিডিও_আইডি     অন্য ভিডিও
  */
 const fs = require("fs");
 const path = require("path");
-const { execFile } = require("child_process");
+const { execFile, spawn } = require("child_process");
+const AdmZip = require("adm-zip");
 
 const BIN = "/tmp/yt-dlp";
+const POT_BIN = "/tmp/bgutil-pot";
+const PLUGIN_DIR = "/tmp/yt-dlp-plugins";
 const COOKIE_FILE = "/tmp/cookies.txt";
+const POT_PORT = 4416;
+const GH = "https://github.com";
 
+async function download(url, dest, mode) {
+	const r = await fetch(url, { redirect: "follow" });
+	if (!r.ok) throw new Error(`নামানো যায়নি (${r.status}): ${url}`);
+	fs.writeFileSync(dest, Buffer.from(await r.arrayBuffer()));
+	if (mode) fs.chmodSync(dest, mode);
+}
+
+function bigEnough(f) {
+	return fs.existsSync(f) && fs.statSync(f).size > 1024 * 1024;
+}
+
+async function ensureYtDlp() {
+	if (bigEnough(BIN)) return;
+	const asset = process.arch === "arm64" ? "yt-dlp_linux_aarch64" : "yt-dlp_linux";
+	await download(`${GH}/yt-dlp/yt-dlp/releases/latest/download/${asset}`, BIN, 0o755);
+}
 
 // কুকিজের লেখা ঠিক করা: পেস্ট করার সময় ট্যাব স্পেস হয়ে গেলে আবার ট্যাব বসায়
 function normalizeCookies(txt) {
@@ -55,16 +78,66 @@ function loadCookies(forceFile) {
 	return { source, cookieLines: n.cookieLines, fixedTabs: n.fixed };
 }
 
-async function ensureBin() {
-	if (fs.existsSync(BIN) && fs.statSync(BIN).size > 1024 * 1024) return;
-	const asset = process.arch === "arm64" ? "yt-dlp_linux_aarch64" : "yt-dlp_linux";
-	const r = await fetch(
-		`https://github.com/yt-dlp/yt-dlp/releases/latest/download/${asset}`,
-		{ redirect: "follow" }
-	);
-	if (!r.ok) throw new Error("yt-dlp নামানো যায়নি: HTTP " + r.status);
-	fs.writeFileSync(BIN, Buffer.from(await r.arrayBuffer()));
-	fs.chmodSync(BIN, 0o755);
+// প্লাগইনের আসল ফোল্ডার খুঁজে বের করা (যেখানে yt_dlp_plugins আছে)
+function findPluginRoot(dir, depth = 0) {
+	if (fs.existsSync(path.join(dir, "yt_dlp_plugins"))) return dir;
+	if (depth > 2) return null;
+	for (const name of fs.readdirSync(dir)) {
+		const p = path.join(dir, name);
+		if (fs.statSync(p).isDirectory()) {
+			const r = findPluginRoot(p, depth + 1);
+			if (r) return r;
+		}
+	}
+	return null;
+}
+
+async function ensurePotPlugin(info) {
+	const target = path.join(PLUGIN_DIR, "bgutil-ytdlp-pot-provider");
+	if (fs.existsSync(path.join(target, "yt_dlp_plugins"))) return;
+
+	const zipPath = "/tmp/bgutil-plugin.zip";
+	await download(`${GH}/jim60105/bgutil-ytdlp-pot-provider-rs/releases/latest/download/bgutil-ytdlp-pot-provider-rs.zip`, zipPath);
+	const tmp = "/tmp/plug_tmp";
+	fs.rmSync(tmp, { recursive: true, force: true });
+	new AdmZip(zipPath).extractAllTo(tmp, true);
+	const root = findPluginRoot(tmp);
+	if (!root) throw new Error("প্লাগইন জিপে yt_dlp_plugins ফোল্ডার পাওয়া যায়নি");
+	fs.mkdirSync(PLUGIN_DIR, { recursive: true });
+	fs.rmSync(target, { recursive: true, force: true });
+	fs.cpSync(root, target, { recursive: true });
+	info.pluginFiles = fs.readdirSync(path.join(target, "yt_dlp_plugins", "extractor"));
+}
+
+async function startPotServer(info) {
+	if (!bigEnough(POT_BIN)) {
+		await download(`${GH}/jim60105/bgutil-ytdlp-pot-provider-rs/releases/latest/download/bgutil-pot-linux-x86_64`, POT_BIN, 0o755);
+	}
+	await ensurePotPlugin(info);
+
+	const proc = spawn(POT_BIN, ["server", "--host", "127.0.0.1", "--port", String(POT_PORT)], {
+		env: { ...process.env, HOME: "/tmp", CACHE_DIR: "/tmp/potcache", RUST_LOG: "info" },
+		stdio: ["ignore", "pipe", "pipe"]
+	});
+	let log = "";
+	const add = d => { log = (log + d).slice(-1500); };
+	proc.stdout.on("data", add);
+	proc.stderr.on("data", add);
+	let exited = null;
+	proc.on("exit", (code, sig) => { exited = `code=${code} sig=${sig}`; });
+	proc.on("error", e => { exited = "spawn error: " + e.message; });
+
+	let ready = false;
+	for (let i = 0; i < 20 && !ready && !exited; i++) {
+		await new Promise(r => setTimeout(r, 500));
+		try {
+			const r = await fetch(`http://127.0.0.1:${POT_PORT}/ping`, { signal: AbortSignal.timeout(1500) });
+			ready = r.ok;
+		} catch (_) { }
+	}
+	info.potServer = ready ? "চালু" : `চালু হয়নি ${exited ? "(" + exited + ")" : ""}`;
+	if (!ready) info.potServerLog = log.slice(-600);
+	return { proc, ready };
 }
 
 function run(args, timeout) {
@@ -90,33 +163,40 @@ module.exports = async (req, res) => {
 	}
 
 	const v = /^[\w-]{11}$/.test(q.v || "") ? q.v : "e2mUj9rGSmQ";
-	const mode = q.mode === "list" ? "list" : "download";
-	const out = { video: v, mode, node: process.version };
+	const usePot = q.pot !== "0";
+	const useCookies = q.cookies === "1";
+	const out = { video: v, node: process.version, usePot, useCookies };
+	let pot = null;
 
 	try {
-		// সার্ভারের বাইরের IP (শুধু জানার জন্য)
 		try {
-			const r = await fetch("https://api.ipify.org?format=json", {
-				signal: AbortSignal.timeout(4000)
-			});
+			const r = await fetch("https://api.ipify.org?format=json", { signal: AbortSignal.timeout(4000) });
 			out.ip = (await r.json()).ip;
 		} catch (_) { }
 
-		await ensureBin();
+		await ensureYtDlp();
 		out.binReadyMs = Date.now() - t0;
 
+		if (usePot) {
+			try {
+				pot = await startPotServer(out);
+			} catch (e) {
+				out.potSetupError = String(e && e.message || e);
+			}
+		}
+
 		const cookieArgs = [];
-		const ck = loadCookies(q.src === "file");
-		out.hasCookies = !!ck;
-		if (ck) {
-			out.cookieInfo = ck;
-			cookieArgs.push("--cookies", COOKIE_FILE);
+		if (useCookies) {
+			const ck = loadCookies(q.src === "file");
+			out.hasCookies = !!ck;
+			if (ck) { out.cookieInfo = ck; cookieArgs.push("--cookies", COOKIE_FILE); }
 		}
 
 		const base = `/tmp/t_${Date.now()}`;
 		const args = [
 			"--js-runtimes", `node:${process.execPath}`,
 			"--remote-components", "ejs:github",
+			"--extractor-args", `youtubepot-bgutilhttp:base_url=http://127.0.0.1:${POT_PORT}`,
 			...cookieArgs,
 			"-v",
 			"--no-playlist",
@@ -124,41 +204,39 @@ module.exports = async (req, res) => {
 			"--retries", "1",
 			"--fragment-retries", "1",
 			"--socket-timeout", "20",
-			"--cache-dir", "/tmp/ytc"
+			"--cache-dir", "/tmp/ytc",
+			"-f", "bestaudio/best",
+			"-o", `${base}.%(ext)s`,
+			`https://www.youtube.com/watch?v=${v}`
 		];
-		if (mode === "list") args.push("-F", "--skip-download");
-		else args.push("-f", "bestaudio/best", "-o", `${base}.%(ext)s`);
-		args.push(`https://www.youtube.com/watch?v=${v}`);
 
-		const r = await run(args, 50000);
+		const r = await run(args, 45000);
 		const text = r.stderr + "\n" + r.stdout;
 
-		// দরকারি লাইনগুলো
 		out.log = text
 			.split("\n")
 			.map(l => l.replace(/^\[debug\]\s*/i, "").trim())
-			.filter(l => /WARNING|ERROR|JS runtimes|jsc|PO Token|403|Sign in|bot|Destination|format|images/i.test(l))
-			.slice(0, 14)
+			.filter(l => /WARNING|ERROR|JS runtimes|PO Token|pot:|bgutil|403|Sign in|bot|Destination|images/i.test(l))
+			.slice(0, 16)
 			.map(l => l.slice(0, 180));
 
-		if (mode === "download") {
-			const file = fs.readdirSync("/tmp").find(f => f.startsWith(base.split("/").pop() + "."));
-			if (file) {
-				out.fileSize = fs.statSync("/tmp/" + file).size;
-				fs.unlinkSync("/tmp/" + file);
-			}
-			out.ok = !r.err && !!out.fileSize;
-		} else {
-			out.ok = !r.err && /audio only/i.test(text);
+		const file = fs.readdirSync("/tmp").find(f => f.startsWith(base.split("/").pop() + "."));
+		if (file) {
+			out.fileSize = fs.statSync("/tmp/" + file).size;
+			fs.unlinkSync("/tmp/" + file);
 		}
+		out.ok = !r.err && !!out.fileSize;
 		out.verdict = out.ok
-			? "✅ ভার্সেল থেকে YouTube কাজ করছে"
-			: "❌ ফেল (log দেখো: 403 / Sign in / images মানে YouTube আটকাচ্ছে)";
+			? "✅ ভার্সেল থেকে YouTube অডিও নামানো গেছে"
+			: "❌ ফেল (log দেখো)";
 	} catch (e) {
 		out.ok = false;
 		out.error = String(e && e.message || e);
+	} finally {
+		if (pot && pot.proc) { try { pot.proc.kill(); } catch (_) { } }
 	}
 
 	out.totalMs = Date.now() - t0;
 	res.status(200).json(out);
 };
+		
