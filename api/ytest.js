@@ -3,12 +3,57 @@
  * ব্যবহার: /api/ytest?key=তোমার_TEST_KEY            (ডাউনলোড পরীক্ষা)
  *          /api/ytest?key=...&mode=list             (শুধু ফরম্যাট তালিকা)
  *          /api/ytest?key=...&v=ভিডিও_আইডি          (অন্য ভিডিও)
+ *          /api/ytest?key=...&src=file              (কুকিজ রিপোর cookies.txt থেকে)
  */
 const fs = require("fs");
+const path = require("path");
 const { execFile } = require("child_process");
 
 const BIN = "/tmp/yt-dlp";
 const COOKIE_FILE = "/tmp/cookies.txt";
+
+
+// কুকিজের লেখা ঠিক করা: পেস্ট করার সময় ট্যাব স্পেস হয়ে গেলে আবার ট্যাব বসায়
+function normalizeCookies(txt) {
+	const lines = String(txt).replace(/\\n/g, "\n").replace(/\r/g, "").split("\n");
+	const out = [];
+	let fixed = 0;
+	let cookieLines = 0;
+	for (const raw of lines) {
+		const line = raw.trim();
+		if (!line) continue;
+		if (line.startsWith("#") && !line.startsWith("#HttpOnly_")) { out.push(line); continue; }
+		const parts = line.split(/\s+/);
+		if (parts.length >= 7) {
+			const fixedLine = [...parts.slice(0, 6), parts.slice(6).join(" ")].join("\t");
+			if (fixedLine !== line) fixed++;
+			out.push(fixedLine);
+			cookieLines++;
+		} else {
+			out.push(line);
+		}
+	}
+	if (!out.length || !/^# (Netscape|HTTP Cookie)/i.test(out[0])) out.unshift("# Netscape HTTP Cookie File");
+	return { text: out.join("\n") + "\n", fixed, cookieLines };
+}
+
+function loadCookies(forceFile) {
+	let raw = null;
+	let source = "none";
+	if (!forceFile && process.env.YT_COOKIES) {
+		raw = process.env.YT_COOKIES;
+		source = "env";
+	} else {
+		try {
+			raw = fs.readFileSync(path.join(process.cwd(), "cookies.txt"), "utf8");
+			source = "file";
+		} catch (_) { }
+	}
+	if (!raw) return null;
+	const n = normalizeCookies(raw);
+	fs.writeFileSync(COOKIE_FILE, n.text);
+	return { source, cookieLines: n.cookieLines, fixedTabs: n.fixed };
+}
 
 async function ensureBin() {
 	if (fs.existsSync(BIN) && fs.statSync(BIN).size > 1024 * 1024) return;
@@ -46,7 +91,7 @@ module.exports = async (req, res) => {
 
 	const v = /^[\w-]{11}$/.test(q.v || "") ? q.v : "e2mUj9rGSmQ";
 	const mode = q.mode === "list" ? "list" : "download";
-	const out = { video: v, mode, node: process.version, hasCookies: !!process.env.YT_COOKIES };
+	const out = { video: v, mode, node: process.version };
 
 	try {
 		// সার্ভারের বাইরের IP (শুধু জানার জন্য)
@@ -61,8 +106,10 @@ module.exports = async (req, res) => {
 		out.binReadyMs = Date.now() - t0;
 
 		const cookieArgs = [];
-		if (process.env.YT_COOKIES) {
-			fs.writeFileSync(COOKIE_FILE, process.env.YT_COOKIES.replace(/\\n/g, "\n"));
+		const ck = loadCookies(q.src === "file");
+		out.hasCookies = !!ck;
+		if (ck) {
+			out.cookieInfo = ck;
 			cookieArgs.push("--cookies", COOKIE_FILE);
 		}
 
